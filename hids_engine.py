@@ -271,26 +271,49 @@ def start_hids():
     test_hash = sha256_engine.inject_test_signature()
     print(f"[*] Test signature injected. Hash: {test_hash}")
 
-    # 1. Initialize Multi-Zone Filesystem Monitoring
-    handler = HidsHandler(sha256_engine, yara_engine)
+    # 1. Define high risk threat zones 
+    home_dir = os.path.expanduser("~")
+    
     watch_directories = [
+        # --- Staging & Dropper Zones (World-Writable) ---
         "/tmp",
         "/var/tmp",
         "/dev/shm",
-        os.path.expanduser("~/.config/autostart")
+        "/run",
+        
+        # --- User-Space Persistence & Drop Zones ---
+        os.path.join(home_dir, "Downloads"),
+        os.path.join(home_dir, ".ssh"),
+        os.path.join(home_dir, ".config/autostart"),
+        os.path.join(home_dir, ".config/systemd/user"),
+        
+        # --- Root / System-Wide Persistence Zones ---
+        "/etc/cron.d",
+        "/var/spool/cron",
+        "/etc/systemd/system",
+        "/usr/local/bin"
     ]
-    
+
+    # 2. Initialize Multi-Zone Filesystem Monitoring
+    handler = HidsHandler(sha256_engine, yara_engine)
     observers = []
     print("[+] Initializing multi-zone filesystem hooks...")
+    
     for directory in watch_directories:
-        os.makedirs(directory, exist_ok=True)
-        observer = Observer()
-        observer.schedule(handler, path=directory, recursive=True)
-        observer.start()
-        observers.append(observer)
-        print(f"  -> Hooked zone: {directory}")
+        try:
+            # Ensure safe user/staging directories exist before attaching the hook
+            os.makedirs(directory, exist_ok=True)
+            observer = Observer()
+            observer.schedule(handler, path=directory, recursive=True)
+            observer.start()
+            observers.append(observer)
+            print(f"  -> Hooked zone: {directory}")
+        except PermissionError:
+            print(f"  [-] Permission denied for zone: {directory} (run with sudo)")
+        except Exception as e:
+            print(f"  [-] Skipped zone {directory}: {e}")
 
-    # 2. Initialize Auditd Execution Monitoring Thread
+    # 3. Initialize Auditd Execution Monitoring Thread
     exec_monitor = HidsExecutionMonitor(sha256_engine, yara_engine)
     exec_monitor.start()
 
