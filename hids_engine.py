@@ -10,6 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
+import ctypes
+import shutil
+from bcc import BPF
 
 
 class HidsSha256Engine:
@@ -98,106 +101,120 @@ class HidsYaraEngine:
         return None
 
 
-class HidsExecutionMonitor(threading.Thread):
-    """Runs in a background thread to intercept kernel execution events via auditd."""
+# eBPF C program running in kernel space
+EBPF_EXECVEAT_PROGRAM = r"""
+#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+
+struct exec_event_t {
+    u32 pid;
+    u32 uid;
+    char comm[TASK_COMM_LEN];
+    char filename[256];
+    char syscall_type[16];
+};
+
+BPF_PERF_OUTPUT(exec_events);
+
+TRACEPOINT_PROBE(syscalls, sys_enter_execveat) {
+    struct exec_event_t event = {};
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = bpf_get_current_uid_gid();
     
+    bpf_get_current_comm(&event.comm, sizeof(event.comm));
+    bpf_probe_read_user_str(&event.filename, sizeof(event.filename), args->filename);
+    __builtin_memcpy(event.syscall_type, "execveat", 9);
+
+    exec_events.perf_submit(args, &event, sizeof(event));
+    return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
+    struct exec_event_t event = {};
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = bpf_get_current_uid_gid();
+    
+    bpf_get_current_comm(&event.comm, sizeof(event.comm));
+    bpf_probe_read_user_str(&event.filename, sizeof(event.filename), args->filename);
+    __builtin_memcpy(event.syscall_type, "execve", 7);
+
+    exec_events.perf_submit(args, &event, sizeof(event));
+    return 0;
+}
+"""
+
+class ExecEvent(ctypes.Structure):
+    _fields_ = [
+        ("pid", ctypes.c_uint32),
+        ("uid", ctypes.c_uint32),
+        ("comm", ctypes.c_char * 16),
+        ("filename", ctypes.c_char * 256),
+        ("syscall_type", ctypes.c_char * 16),
+    ]
+
+class HidsEbpfExecutionMonitor(threading.Thread):
     def __init__(self, sha256_engine: HidsSha256Engine, yara_engine: HidsYaraEngine):
         super().__init__(daemon=True)
         self.engine = sha256_engine
         self.yara_engine = yara_engine
-        self.audit_log_path = "/var/log/audit/audit.log"
-        
-        # Automatically arm the kernel trap when the thread initializes
-        self.ensure_kernel_trap_is_armed()
-
-    def ensure_kernel_trap_is_armed(self):
-        """Checks if the custom auditd rule is active, and injects it if missing."""
-        try:
-            current_rules = subprocess.check_output(["sudo", "auditctl", "-l"], text=True)
-            
-            if "hids_execution_trap" not in current_rules:
-                print("[*] HIDS kernel trap not found. Injecting rule automatically...")
-                subprocess.run([
-                    "sudo", "auditctl", 
-                    "-a", "always,exit", 
-                    "-F", "arch=b64", 
-                    "-S", "execve", 
-                    "-k", "hids_execution_trap"
-                ], check=True)
-                print("[+] Kernel execution trap successfully armed.")
-            else:
-                print("[*] Kernel execution trap already active.")
-                
-        except subprocess.CalledProcessError as e:
-            print(f"[-] Failed to configure auditd rules: {e}")
-        except FileNotFoundError:
-            print("[-] auditctl binary not found. Is the 'audit' package installed?")
+        self.running = True
+        self.bpf = None
 
     def run(self):
-        print(f"[+] Hooking into kernel auditd stream for execution events...")
-        if not os.path.exists(self.audit_log_path):
-            print(f"[-] Audit log not found at {self.audit_log_path}. Ensure auditd is installed and running.")
-            return
-            
-        with open(self.audit_log_path, "r") as f:
-            f.seek(0, 2) # Jump to the end of the file
-            
-            while True:
-                line = f.readline()
-                if not line:
-                    time.sleep(0.1)
-                    continue
-                
-                if "hids_execution_trap" in line and "type=EXECVE" in line:
-                    self.parse_and_scan(line)
-
-    def parse_and_scan(self, log_line: str):
-        """Extracts the executable path and chains it through Tier 1 and Tier 2 scanning logic."""
+        print("[+] Compiling and loading eBPF kernel probes (execve & execveat)...")
         try:
-            parts = log_line.split(" ")
-            for part in parts:
-                if part.startswith('a0="'):
-                    binary_path = part[4:-1]
-                    
-                    if Path(binary_path).exists():
-                        print(f"\n[*] Process Execution Intercepted: {binary_path}")
-                        
-                        # --- TIER 1: HASH LOOKUP ---
-                        file_hash = self.engine.calculate_sha256(binary_path)
-                        malware_name = self.engine.lookup_hash(file_hash)
-                        
-                        if malware_name:
-                            alert = {
-                                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                                "engine_tier": "EXECUTION_INTERCEPT_HASH",
-                                "status": "ALERT",
-                                "file_path": binary_path,
-                                "calculated_hash": file_hash,
-                                "signature_match": malware_name,
-                                "action_taken": "DETECTED",
-                            }
-                            print(f"[!!!] MALICIOUS PROCESS EXECUTION DETECTED (TIER 1) [!!!]\n{json.dumps(alert, indent=4)}")
-                            break
+            self.bpf = BPF(text=EBPF_EXECVEAT_PROGRAM)
+            self.bpf["exec_events"].open_perf_buffer(self._handle_event)
+            print("[+] eBPF kernel execution trap active and listening to perf ring buffer.")
+        except Exception as e:
+            print(f"[-] Failed to load eBPF probe: {e}")
+            return
 
-                        # --- TIER 2: YARA PATTERN MATCHING ---
-                        yara_match = self.yara_engine.scan_file(binary_path)
-                        if yara_match:
-                            alert = {
-                                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                                "engine_tier": "EXECUTION_INTERCEPT_HEURISTIC",
-                                "status": "ALERT",
-                                "file_path": binary_path,
-                                "calculated_hash": file_hash,
-                                "signature_match": yara_match,
-                                "action_taken": "DETECTED",
-                            }
-                            print(f"[!!!] MALICIOUS PROCESS EXECUTION DETECTED (TIER 2) [!!!]\n{json.dumps(alert, indent=4)}")
-                            break
-                            
-                        print(f"[*] Executed binary verified clean across Tier 1 & Tier 2.")
-                    break
+        while self.running:
+            try:
+                self.bpf.perf_buffer_poll(timeout=100)
+            except KeyboardInterrupt:
+                break
+            except Exception:
+                break
+
+    def _handle_event(self, cpu, data, size):
+        event = ctypes.cast(data, ctypes.POINTER(ExecEvent)).contents
+        raw_filename = event.filename.decode("utf-8", errors="ignore").strip()
+        syscall_used = event.syscall_type.decode("utf-8", errors="ignore").strip()
+        comm = event.comm.decode("utf-8", errors="ignore").strip()
+
+        if not raw_filename:
+            return
+
+        resolved_path = raw_filename
+        if not os.path.isabs(resolved_path):
+            found_binary = shutil.which(resolved_path)
+            if found_binary:
+                resolved_path = found_binary
+
+        if Path(resolved_path).is_file():
+            self._scan_execution(resolved_path, comm, event.pid, syscall_used)
+
+    def _scan_execution(self, binary_path: str, comm: str, pid: int, syscall_used: str):
+        try:
+            file_hash = self.engine.calculate_sha256(binary_path)
+            malware_name = self.engine.lookup_hash(file_hash)
+
+            if malware_name:
+                print(f"[!!!] MALICIOUS PROCESS (TIER 1): {binary_path} via {syscall_used}")
+                return
+
+            yara_match = self.yara_engine.scan_file(binary_path)
+            if yara_match:
+                print(f"[!!!] MALICIOUS PROCESS (TIER 2): {binary_path} via {syscall_used}")
+                return
+
         except Exception:
             pass
+
+    def stop(self):
+        self.running = False
 
 
 class HidsHandler(FileSystemEventHandler):
@@ -313,8 +330,8 @@ def start_hids():
         except Exception as e:
             print(f"  [-] Skipped zone {directory}: {e}")
 
-    # 3. Initialize Auditd Execution Monitoring Thread
-    exec_monitor = HidsExecutionMonitor(sha256_engine, yara_engine)
+    # 3. Initialize eBPF Execution Monitoring Thread
+    exec_monitor = HidsEbpfExecutionMonitor(sha256_engine, yara_engine)
     exec_monitor.start()
 
     try:
@@ -322,6 +339,7 @@ def start_hids():
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n[*] Stopping HIDS Engine...")
+        exec_monitor.stop()
         for o in observers:
             o.stop()
         for o in observers:
