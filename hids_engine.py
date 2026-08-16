@@ -13,7 +13,43 @@ from watchdog.observers import Observer
 import ctypes
 import shutil
 from bcc import BPF
+import signal
 
+def map_mitre_attack(engine_tier: str, detection_context: str, match_name: str) -> dict:
+    match_lower = match_name.lower()
+    
+    if detection_context == "PROCESS_EXECUTION":
+        mitre_data = {
+            "tactic": "Execution",
+            "technique_id": "T1204.002",
+            "technique_name": "User Execution: Malicious File"
+        }
+        if any(term in match_lower for term in ["sh", "bash", "script", "python"]):
+            mitre_data = {
+                "tactic": "Execution",
+                "technique_id": "T1059.004",
+                "technique_name": "Command and Scripting Interpreter: Unix Shell"
+            }
+    else:  # FILE_DROP
+        mitre_data = {
+            "tactic": "Defense Evasion",
+            "technique_id": "T1027",
+            "technique_name": "Obfuscated/Compromised Files or Information"
+        }
+        if any(term in match_lower for term in ["mirai", "botnet", "gafgyt", "tsunami"]):
+            mitre_data = {
+                "tactic": "Impact / Command and Control",
+                "technique_id": "T1498 / T1071",
+                "technique_name": "Network Denial of Service / Application Layer Protocol"
+            }
+        elif "webshell" in match_lower:
+            mitre_data = {
+                "tactic": "Persistence",
+                "technique_id": "T1505.003",
+                "technique_name": "Server Software Component: Web Shell"
+            }
+
+    return mitre_data
 
 class HidsSha256Engine:
     def __init__(self, db_path: str = "hids_signatures.db"):
@@ -88,17 +124,27 @@ class HidsYaraEngine:
             return None
 
     def scan_file(self, file_path: str) -> str | None:
-        """Scans a target file payload against the compiled YARA ruleset."""
+        """Scans target file with timeout and prioritizes specific malware rules over generic ones."""
         if not self.rules:
             return None
         try:
-            matches = self.rules.match(file_path)
-            if matches:
-                # Returns 'Namespace -> Rule_Name'
-                return f"{matches[0].namespace} -> {matches[0].rule}"
-        except Exception as e:
-            print(f"[-] YARA scan error on {file_path}: {e}")
-        return None
+            matches = self.rules.match(file_path, timeout=2)
+            if not matches:
+                return None
+
+            # Prioritize high-fidelity rules over generic utility matchers
+            for match in matches:
+                ns = match.namespace.lower()
+                r = match.rule.lower()
+                if not ns.startswith("utils_") and "generic" not in r:
+                    return f"{match.namespace} -> {match.rule}"
+
+            return f"[GENERIC] {matches[0].namespace} -> {matches[0].rule}"
+
+        except yara.TimeoutError:
+            return None
+        except Exception:
+            return None
 
 
 # eBPF C program running in kernel space
@@ -106,12 +152,16 @@ EBPF_EXECVEAT_PROGRAM = r"""
 #include <uapi/linux/ptrace.h>
 #include <linux/sched.h>
 
+// THE BRIDGE
+BPF_HASH(blocked_pids, u32, u32);
+
 struct exec_event_t {
     u32 pid;
     u32 uid;
     char comm[TASK_COMM_LEN];
     char filename[256];
     char syscall_type[16];
+    u32 kernel_killed; // THE RECEIPT
 };
 
 BPF_PERF_OUTPUT(exec_events);
@@ -124,6 +174,14 @@ TRACEPOINT_PROBE(syscalls, sys_enter_execveat) {
     bpf_get_current_comm(&event.comm, sizeof(event.comm));
     bpf_probe_read_user_str(&event.filename, sizeof(event.filename), args->filename);
     __builtin_memcpy(event.syscall_type, "execveat", 9);
+
+    u32 *is_blocked = blocked_pids.lookup(&event.pid);
+    if (is_blocked) {
+        bpf_send_signal(9);
+        event.kernel_killed = 1;
+    } else {
+        event.kernel_killed = 0;
+    }
 
     exec_events.perf_submit(args, &event, sizeof(event));
     return 0;
@@ -138,6 +196,14 @@ TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
     bpf_probe_read_user_str(&event.filename, sizeof(event.filename), args->filename);
     __builtin_memcpy(event.syscall_type, "execve", 7);
 
+    u32 *is_blocked = blocked_pids.lookup(&event.pid);
+    if (is_blocked) {
+        bpf_send_signal(9);
+        event.kernel_killed = 1;
+    } else {
+        event.kernel_killed = 0;
+    }
+
     exec_events.perf_submit(args, &event, sizeof(event));
     return 0;
 }
@@ -150,6 +216,7 @@ class ExecEvent(ctypes.Structure):
         ("comm", ctypes.c_char * 16),
         ("filename", ctypes.c_char * 256),
         ("syscall_type", ctypes.c_char * 16),
+        ("kernel_killed", ctypes.c_uint32),
     ]
 
 class HidsEbpfExecutionMonitor(threading.Thread):
@@ -159,6 +226,16 @@ class HidsEbpfExecutionMonitor(threading.Thread):
         self.yara_engine = yara_engine
         self.running = True
         self.bpf = None
+        # System paths protected by root permissions (Tier 2 skipped)
+        self.safe_system_prefixes = (
+            "/usr/bin/", "/usr/sbin/", "/usr/lib/", "/usr/lib64/", 
+            "/usr/libexec/", "/lib/", "/lib64/", "/bin/", "/sbin/"
+        )
+
+        # High-risk staging directories (Tier 2 Scanned)
+        self.untrusted_execution_prefixes = (
+            "/tmp", "/var/tmp", "/dev/shm", "/run/user", "/home", "/root"
+        )
 
     def run(self):
         print("[+] Compiling and loading eBPF kernel probes (execve & execveat)...")
@@ -178,6 +255,40 @@ class HidsEbpfExecutionMonitor(threading.Thread):
             except Exception:
                 break
 
+    def _enforce_kill_and_delete(self, pid, binary_path, engine_tier, signature_match, mitre_tag, syscall_used, process_name):
+        action = "FAILED"
+        try:
+            os.kill(pid, signal.SIGKILL)
+            action = "TERMINATED"
+        except ProcessLookupError:
+            action = "PROCESS_ALREADY_DEAD"
+        except Exception as e:
+            action = f"KILL_FAILED_{str(e)}"
+            
+        if action in ["TERMINATED", "PROCESS_ALREADY_DEAD"]:
+            try:
+                os.remove(binary_path)
+                action = "TERMINATED_AND_DELETED"
+            except FileNotFoundError:
+                action = "TERMINATED_BUT_ALREADY_DELETED"
+            except Exception:
+                action = "TERMINATED_BUT_DELETE_FAILED"
+
+        alert = {
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "engine_tier": engine_tier,
+            "detection_context": "PROCESS_EXECUTION",
+            "status": "CRITICAL",
+            "pid": pid,
+            "process_name": process_name,
+            "binary_path": binary_path,
+            "syscall": syscall_used,
+            "signature_match": signature_match,
+            "mitre_attack": mitre_tag,
+            "action_taken": action
+        }
+        print(f"\n[!!!] MALICIOUS EXECUTION NEUTRALIZED [!!!]\n{json.dumps(alert, indent=4)}")
+
     def _handle_event(self, cpu, data, size):
         event = ctypes.cast(data, ctypes.POINTER(ExecEvent)).contents
         raw_filename = event.filename.decode("utf-8", errors="ignore").strip()
@@ -189,9 +300,33 @@ class HidsEbpfExecutionMonitor(threading.Thread):
 
         resolved_path = raw_filename
         if not os.path.isabs(resolved_path):
-            found_binary = shutil.which(resolved_path)
-            if found_binary:
-                resolved_path = found_binary
+            try:
+                resolved_path = os.readlink(f"/proc/{event.pid}/exe")
+            except (OSError, FileNotFoundError):
+                found_binary = shutil.which(resolved_path)
+                if found_binary:
+                    resolved_path = found_binary
+
+        if event.kernel_killed == 1:
+            action = "TERMINATED_IN_KERNEL_ONLY"
+            if Path(resolved_path).is_file():
+                try:
+                    os.remove(resolved_path)
+                    action = "TERMINATED_IN_KERNEL_AND_DELETED"
+                except Exception:
+                    pass
+
+            alert = {
+                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "engine_tier": "EBPF_KERNEL_ENFORCEMENT",
+                "status": "CRITICAL",
+                "pid": event.pid,
+                "process_name": comm,
+                "binary_path": resolved_path,
+                "action_taken": action
+            }
+            print(f"\n[!!!] KERNEL-LEVEL KILL SUCCESSFUL [!!!]\n{json.dumps(alert, indent=4)}")
+            return
 
         if Path(resolved_path).is_file():
             self._scan_execution(resolved_path, comm, event.pid, syscall_used)
@@ -202,14 +337,36 @@ class HidsEbpfExecutionMonitor(threading.Thread):
             malware_name = self.engine.lookup_hash(file_hash)
 
             if malware_name:
-                print(f"[!!!] MALICIOUS PROCESS (TIER 1): {binary_path} via {syscall_used}")
+                mitre_tag = map_mitre_attack("SHA256_SIGNATURE", "PROCESS_EXECUTION", malware_name)
+                self._enforce_kill_and_delete(pid, binary_path, "SHA256_SIGNATURE", malware_name, mitre_tag, syscall_used, comm)
                 return
 
-            yara_match = self.yara_engine.scan_file(binary_path)
-            if yara_match:
-                print(f"[!!!] MALICIOUS PROCESS (TIER 2): {binary_path} via {syscall_used}")
+            if binary_path.startswith(self.safe_system_prefixes):
                 return
 
+            if binary_path.startswith(self.untrusted_execution_prefixes):
+                yara_match = self.yara_engine.scan_file(binary_path)
+                if yara_match:
+                    if not yara_match.startswith("[GENERIC]"):
+                        mitre_tag = map_mitre_attack("YARA_HEURISTICS", "PROCESS_EXECUTION", yara_match)
+                        self._enforce_kill_and_delete(pid, binary_path, "YARA_HEURISTICS", yara_match, mitre_tag, syscall_used, comm)
+                        return
+                    else:
+                        mitre_tag = map_mitre_attack("YARA_HEURISTICS", "PROCESS_EXECUTION", yara_match)
+                        alert = {
+                            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                            "engine_tier": "YARA_HEURISTICS",
+                            "detection_context": "PROCESS_EXECUTION",
+                            "status": "SUSPICIOUS",
+                            "pid": pid,
+                            "process_name": comm,
+                            "binary_path": binary_path,
+                            "syscall": syscall_used,
+                            "signature_match": yara_match,
+                            "mitre_attack": mitre_tag,
+                            "action_taken": "LOGGED"
+                        }
+                        print(f"\n[!!!] SUSPICIOUS EXECUTION LOGGED (TIER 2) [!!!]\n{json.dumps(alert, indent=4)}")
         except Exception:
             pass
 
@@ -222,50 +379,89 @@ class HidsHandler(FileSystemEventHandler):
         self.engine = sha256_engine
         self.yara_engine = yara_engine
         self.recent_events = {}
+        # Ephemeral desktop rendering prefixes to ignore
+        self.ephemeral_prefixes = (
+            "/tmp/gdk-pixbuf-", "/tmp/glycin-", "/tmp/gnome-desktop-", 
+            "/tmp/.org.chromium.", "/tmp/systemd-private-", "/var/tmp/systemd-private-"
+        )
 
     def process_file(self, file_path: str):
         if not os.path.isfile(file_path):
             return
 
+        if any(file_path.startswith(prefix) for prefix in self.ephemeral_prefixes):
+            return
+
+        # Discard 0-byte files to prevent creation race condition
+        try:
+            if os.path.getsize(file_path) == 0:
+                return
+        except OSError:
+            return
+
+        # Reduced debounce window to 0.1s
         current_time = time.time()
-        if file_path in self.recent_events and (current_time - self.recent_events[file_path]) < 1.0:
+        if file_path in self.recent_events and (current_time - self.recent_events[file_path]) < 0.1:
             return
         self.recent_events[file_path] = current_time
 
         try:
-            # --- TIER 1: SHA256 Signature Scan ---
+            # Tier 1: SHA256 Signature Scan
             file_hash = self.engine.calculate_sha256(file_path)
             malware_name = self.engine.lookup_hash(file_hash)
 
+
             if malware_name:
+                mitre_tag = map_mitre_attack("SHA256_SIGNATURE", "FILE_DROP", malware_name)
+
+                action = "DETECTED"
+                try:
+                    os.remove(file_path)
+                    action = "DELETED_FROM_DISK"
+                except Exception:
+                    action = "QUARANTINE_FAILED"
+
                 alert = {
                     "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "engine_tier": "SHA256_SIGNATURE",
+                    "detection_context": "FILE_DROP",
                     "status": "ALERT",
                     "file_path": str(Path(file_path).resolve()),
                     "calculated_hash": file_hash,
                     "signature_match": malware_name,
-                    "action_taken": "DETECTED",
+                    "mitre_attack": mitre_tag,
+                    "action_taken": action,
                 }
                 print(f"\n[!!!] MALICIOUS FILE DROP DETECTED (TIER 1) [!!!]\n{json.dumps(alert, indent=4)}")
                 return
 
-            # --- TIER 2: YARA Heuristic Scan ---
+            # Tier 2: YARA Heuristic Scan
             yara_match = self.yara_engine.scan_file(file_path)
             if yara_match:
+                mitre_tag = map_mitre_attack("YARA_HEURISTICS", "FILE_DROP", yara_match)
+                status_level = "SUSPICIOUS" if yara_match.startswith("[GENERIC]") else "ALERT"
+
+                action = "LOGGED"
+                if status_level == "ALERT":
+                    try:
+                        os.remove(file_path)
+                        action = "DELETED_FROM_DISK"
+                    except Exception:
+                        action = "QUARANTINE_FAILED"
+
                 alert = {
                     "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "engine_tier": "YARA_HEURISTICS",
-                    "status": "ALERT",
+                    "detection_context": "FILE_DROP",
+                    "status": status_level,
                     "file_path": str(Path(file_path).resolve()),
                     "calculated_hash": file_hash,
                     "signature_match": yara_match,
-                    "action_taken": "DETECTED",
+                    "mitre_attack": mitre_tag,
+                    "action_taken": action,
                 }
                 print(f"\n[!!!] MALICIOUS PATTERN DROP DETECTED (TIER 2) [!!!]\n{json.dumps(alert, indent=4)}")
                 return
-                
-            print(f"[*] File drop clean across deterministic layers: {file_path}")
 
         except (PermissionError, FileNotFoundError):
             pass
@@ -289,20 +485,24 @@ def start_hids():
     print(f"[*] Test signature injected. Hash: {test_hash}")
 
     # 1. Define high risk threat zones 
-    home_dir = os.path.expanduser("~")
-    
+    # Resolve true user home directory when running via sudo
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        user_home = Path(f"/home/{sudo_user}")
+    else:
+        user_home = Path.home()
+
     watch_directories = [
         # --- Staging & Dropper Zones (World-Writable) ---
         "/tmp",
         "/var/tmp",
         "/dev/shm",
-        "/run",
         
         # --- User-Space Persistence & Drop Zones ---
-        os.path.join(home_dir, "Downloads"),
-        os.path.join(home_dir, ".ssh"),
-        os.path.join(home_dir, ".config/autostart"),
-        os.path.join(home_dir, ".config/systemd/user"),
+        str(user_home / "Downloads"),
+        str(user_home / ".ssh"),
+        str(user_home / ".config/autostart"),
+        str(user_home / ".config/systemd/user"),
         
         # --- Root / System-Wide Persistence Zones ---
         "/etc/cron.d",
