@@ -1,0 +1,6 @@
+watchdog
+yara-python
+torch
+scikit-learn
+pandas
+numpy
