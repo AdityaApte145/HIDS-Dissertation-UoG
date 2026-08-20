@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
+import os
+import pickle
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import pandas as pd
-import numpy as np
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
-import os
-import pickle
+from torch.utils.data import DataLoader, TensorDataset
 
 CSV_FILE = "normal_syscall_traffic.csv"
 MODEL_PATH = "hids_autoencoder.pth"
-SCALER_PATH = "scaler_min_max.npy"
+SCALER_PATH = "scaler.pkl"
 
 # Must match the features collected in collector.py
 MONITORED_SYSCALLS = [
@@ -22,7 +24,7 @@ MONITORED_SYSCALLS = [
 class SyscallAutoencoder(nn.Module):
     def __init__(self, input_dim):
         super(SyscallAutoencoder, self).__init__()
-        # Encoder: Compresses 40 syscall features down to a latent bottleneck of 8 dimensions
+        # Encoder: 40 -> 24 -> 12 -> 8 (Latent Bottleneck)
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, 24),
             nn.ReLU(),
@@ -30,14 +32,14 @@ class SyscallAutoencoder(nn.Module):
             nn.ReLU(),
             nn.Linear(12, 8)
         )
-        # Decoder: Reconstructs the 8 dimensions back up to 40 features
+        # Decoder: 8 -> 12 -> 24 -> 40
         self.decoder = nn.Sequential(
             nn.Linear(8, 12),
             nn.ReLU(),
             nn.Linear(12, 24),
             nn.ReLU(),
             nn.Linear(24, input_dim),
-            nn.Sigmoid() # Keeps outputs scaled between 0 and 1
+            nn.Sigmoid()  # Normalization maps to [0, 1]
         )
 
     def forward(self, x):
@@ -53,57 +55,86 @@ def main():
     print(f"[+] Loading baseline dataset from {CSV_FILE}...")
     df = pd.read_csv(CSV_FILE)
 
-    # Extract only the feature columns (sys_0, sys_1, etc.)
+    # Extract feature columns
     feature_cols = [f"sys_{s}" for s in MONITORED_SYSCALLS]
     data = df[feature_cols].values
 
     print(f"[+] Dataset shape: {data.shape} (Samples x Features)")
 
-    # Normalize data between 0.0 and 1.0 using MinMaxScaler
+    # 1. Train / Validation Split (80% Train, 20% Val)
+    train_data, val_data = train_test_split(data, test_size=0.2, random_state=42, shuffle=True)
+
+    # 2. Fit Scaler only on Training Data
     print("[+] Normalizing feature matrix...")
     scaler = MinMaxScaler()
-    data_scaled = scaler.fit_transform(data)
+    train_scaled = scaler.fit_transform(train_data)
+    val_scaled = scaler.transform(val_data)
 
-    # Save the fitted scaler object using pickle
-    with open("scaler.pkl", "wb") as f:
+    # Save fitted scaler
+    with open(SCALER_PATH, "wb") as f:
         pickle.dump(scaler, f)
-    print("[+] Scaler object saved to scaler.pkl")
-    # Convert to PyTorch Tensors
-    tensor_data = torch.tensor(data_scaled, dtype=torch.float32)
+    print(f"[+] Scaler object saved to {SCALER_PATH}")
 
-    # Initialize Model, Loss Function, and Optimizer
+    # Convert to Tensors
+    train_tensor = torch.tensor(train_scaled, dtype=torch.float32)
+    val_tensor = torch.tensor(val_scaled, dtype=torch.float32)
+
+    # DataLoader setup
+    batch_size = 128
+    train_loader = DataLoader(TensorDataset(train_tensor), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(TensorDataset(val_tensor), batch_size=batch_size, shuffle=False)
+
+    # Initialize Model, Loss, Optimizer
     input_dim = len(MONITORED_SYSCALLS)
     model = SyscallAutoencoder(input_dim)
-    criterion = nn.MSELoss() # Mean Squared Error reconstruction loss
+    criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    epochs = 50
-    batch_size = 64
-    dataset = torch.utils.data.TensorDataset(tensor_data)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    epochs = 20
+    print(f"[+] Training PyTorch Autoencoder for {epochs} epochs (Batch Size: {batch_size})...")
 
-    print(f"[+] Training PyTorch Autoencoder for {epochs} epochs...")
-    model.train()
     for epoch in range(epochs):
-        epoch_loss = 0
-        for batch in dataloader:
+        model.train()
+        train_loss = 0.0
+        for batch in train_loader:
             inputs = batch[0]
-            
-            # Forward pass
             outputs = model(inputs)
             loss = criterion(outputs, inputs)
             
-            # Backward pass & optimize
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
-            epoch_loss += loss.item()
+            train_loss += loss.item()
 
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"Epoch [{epoch+1}/{epochs}], Loss: {epoch_loss/len(dataloader):.6f}")
+        # Validation Step
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                inputs = batch[0]
+                outputs = model(inputs)
+                loss = criterion(outputs, inputs)
+                val_loss += loss.item()
 
-    # Save the trained model weights
+        avg_train = train_loss / len(train_loader)
+        avg_val = val_loss / len(val_loader)
+        print(f"Epoch [{epoch+1:02d}/{epochs:02d}] - Train Loss: {avg_train:.6f} | Val Loss: {avg_val:.6f}")
+
+    # --- Threshold calibration on held-out benign validation data ---
+    model.eval()
+    with torch.no_grad():
+        recon = model(val_tensor)
+        errors = ((recon - val_tensor) ** 2).mean(dim=1).numpy()
+
+    mu, sigma = float(errors.mean()), float(errors.std())
+    print("\n[+] Calibration on benign validation set:")
+    print(f"    Mean (mu)      : {mu:.6f}")
+    print(f"    Std Dev (sigma): {sigma:.6f}")
+    print(f"    tau = mu + 3s  : {mu + 3*sigma:.6f}")
+    for p in (95, 99, 99.9):
+        print(f"    p{p:<5}         : {np.percentile(errors, p):.6f}")
+
+    # Save Model Weights
     torch.save(model.state_dict(), MODEL_PATH)
     print(f"[+] Training complete! Model weights saved to {MODEL_PATH}")
 
