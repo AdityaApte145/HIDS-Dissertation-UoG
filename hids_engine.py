@@ -13,6 +13,7 @@ import pwd
 import pickle
 from datetime import datetime, timezone
 from pathlib import Path
+import psutil
 
 import yara
 import numpy as np
@@ -25,13 +26,16 @@ from watchdog.observers import Observer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Added this lock globally to prevent LLVM Segfaults
+bcc_compile_lock = threading.Lock()
+
 # ML Constants & Paths
 MODEL_PATH = os.path.join(BASE_DIR, "hids_autoencoder.pth")
 SCALER_PATH = os.path.join(BASE_DIR, "scaler.pkl")
 SIGNATURE_DB_PATH = os.path.join(BASE_DIR, "hids_signatures.db")
 YARA_RULES_DIR = os.path.join(BASE_DIR, "yara_rules")
 
-ANOMALY_THRESHOLD = 0.05
+ANOMALY_THRESHOLD = 0.025
 MONITORED_SYSCALLS = [
     0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 16, 20, 21, 22, 23, 39, 41, 
     42, 43, 44, 45, 49, 50, 56, 57, 59, 60, 62, 72, 78, 87, 101, 102, 105, 257, 322, 332
@@ -46,6 +50,37 @@ def record_alert(alert_dict: dict):
             f.write(json.dumps(alert_dict) + "\n")
     except Exception:
         pass
+
+def kill_entire_process_tree(pid: int) -> int:
+    """
+    Recursively terminates a process and all its child worker processes.
+    Returns the total number of killed processes.
+    """
+    if pid <= 1:
+        return 0
+        
+    try:
+        parent = psutil.Process(pid)
+        children = parent.children(recursive=True)
+        
+        # Kill all children first (bottom-up)
+        for child in children:
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                pass
+                
+        # Kill the parent
+        parent.kill()
+        
+        return len(children) + 1
+    except (psutil.NoSuchProcess, PermissionError, Exception):
+        # Fallback to standard OS kill if psutil hits a permission wall
+        try:
+            os.kill(pid, signal.SIGKILL)
+            return 1
+        except Exception:
+            return 0
 
 def map_mitre_attack(engine_tier: str, detection_context: str, match_name: str) -> dict:
     match_lower = match_name.lower()
@@ -193,8 +228,22 @@ class HidsYaraEngine:
             print(f"\n[-] YARA Compilation Error!\n{e}")
             return None
 
+    # Namespaces whose rules constitute weak evidence: they match structural,
+    # encoding or capability artefacts (base64 alphabets, embedded URLs, packer
+    # stubs, syscall capabilities) that are common in legitimate binaries.
+    LOW_CONFIDENCE_NAMESPACES = (
+        "utils_",           # base64, domain, ip, magic, url, suspicious_strings
+        "crypto_",          # crypto constant tables
+        "packers_",         # packing is not itself malicious
+        "capabilities_",    # capability enumeration, not attribution
+        "yara_generic_",    # generic_cryptors, generic_dumps
+    )
+
+    # Rule-name prefixes used by the upstream ruleset (Roth et al.) to denote
+    # hunting rules rather than confirmed malware-family attribution.
+    LOW_CONFIDENCE_RULE_PREFIXES = ("susp_", "gen_", "hunt_", "pua_", "anomaly_")
+
     def scan_file(self, file_path: str) -> str | None:
-        """Scans target file with timeout and prioritizes specific malware rules over generic ones."""
         if not self.rules:
             return None
         try:
@@ -202,12 +251,16 @@ class HidsYaraEngine:
             if not matches:
                 return None
 
-            # Prioritize high-fidelity rules over generic utility matchers
             for match in matches:
                 ns = match.namespace.lower()
                 r = match.rule.lower()
-                if not ns.startswith("utils_") and "generic" not in r:
-                    return f"{match.namespace} -> {match.rule}"
+                if ns.startswith(self.LOW_CONFIDENCE_NAMESPACES):
+                    continue
+                if r.startswith(self.LOW_CONFIDENCE_RULE_PREFIXES):
+                    continue
+                if "generic" in r or "base64" in r:
+                    continue
+                return f"{match.namespace} -> {match.rule}"
 
             return f"[GENERIC] {matches[0].namespace} -> {matches[0].rule}"
 
@@ -232,17 +285,20 @@ struct exec_event_t {
     char filename[256];
     char syscall_type[16];
     u32 kernel_killed;
+    int fd;
 };
 
 BPF_PERF_OUTPUT(exec_events);
 
-static __always_inline int process_exec(void *ctx, const char __user *filename, const char *sys_name, size_t sys_len) {
+static __always_inline int process_exec(void *ctx, const char __user *filename,
+                                        const char *sys_name, size_t sys_len, int fd) {
     u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (ignored_pids.lookup(&pid)) return 0; // SELF EXCLUSION
 
     struct exec_event_t event = {};
     event.pid = pid;
     event.uid = bpf_get_current_uid_gid();
+    event.fd = fd;
     bpf_get_current_comm(&event.comm, sizeof(event.comm));
     bpf_probe_read_user_str(&event.filename, sizeof(event.filename), filename);
     __builtin_memcpy(event.syscall_type, sys_name, sys_len);
@@ -258,8 +314,8 @@ static __always_inline int process_exec(void *ctx, const char __user *filename, 
     return 0;
 }
 
-TRACEPOINT_PROBE(syscalls, sys_enter_execveat) { return process_exec(args, args->filename, "execveat", 9); }
-TRACEPOINT_PROBE(syscalls, sys_enter_execve) { return process_exec(args, args->filename, "execve", 7); }
+TRACEPOINT_PROBE(syscalls, sys_enter_execveat) { return process_exec(args, args->filename, "execveat", 9, args->fd); }
+TRACEPOINT_PROBE(syscalls, sys_enter_execve) { return process_exec(args, args->filename, "execve", 7, -1); }
 """
 
 class ExecEvent(ctypes.Structure):
@@ -267,6 +323,7 @@ class ExecEvent(ctypes.Structure):
         ("pid", ctypes.c_uint32), ("uid", ctypes.c_uint32),
         ("comm", ctypes.c_char * 16), ("filename", ctypes.c_char * 256),
         ("syscall_type", ctypes.c_char * 16), ("kernel_killed", ctypes.c_uint32),
+        ("fd", ctypes.c_int),
     ]
 
 class HidsEbpfExecutionMonitor(threading.Thread):
@@ -276,42 +333,85 @@ class HidsEbpfExecutionMonitor(threading.Thread):
         self.running, self.bpf = True, None
         self.safe_system_prefixes = ("/usr/bin/", "/usr/sbin/", "/usr/lib/", "/usr/lib64/", "/usr/libexec/", "/lib/", "/lib64/", "/bin/", "/sbin/")
         self.untrusted_execution_prefixes = ("/tmp", "/var/tmp", "/dev/shm", "/run/user", "/home", "/root")
+        # Set to False to make fileless execution log-only instead of auto-terminate.
+        self.kill_on_fileless = False
 
     def run(self):
         try:
-            self.bpf = BPF(text=EBPF_EXECUTION_PROBE)
-            self.bpf["ignored_pids"][ctypes.c_uint32(self.engine_pid)] = ctypes.c_uint8(1) # Register self
+            with bcc_compile_lock:
+                self.bpf = BPF(text=EBPF_EXECUTION_PROBE)
+                self.bpf["ignored_pids"][ctypes.c_uint32(self.engine_pid)] = ctypes.c_uint8(1)
             self.bpf["exec_events"].open_perf_buffer(self._handle_event)
             print("[+] [Tier 1/2] eBPF execution trap active (execve/execveat).")
         except Exception as e:
             print(f"[-] Failed to load eBPF execution probe: {e}")
             return
+
         while self.running:
             try: self.bpf.perf_buffer_poll(timeout=100)
             except Exception: break
 
     def _enforce_kill_and_delete(self, pid, binary_path, engine_tier, signature_match, mitre_tag, syscall_used, process_name):
-        action = "FAILED"
+        # --- Containment: terminate the process and all descendants ---
+        killed_count = kill_entire_process_tree(pid)
+        if killed_count > 0:
+            kill_status = f"TERMINATED_TREE_({killed_count}_PROCESSES)"
+        else:
+            kill_status = "PROCESS_ALREADY_DEAD_OR_DENIED"
+
+        # Register PID in the kernel blocklist so any re-exec attempt is
+        # SIGKILLed in-kernel before the syscall completes.
         try:
-            os.kill(pid, signal.SIGKILL)
-            action = "TERMINATED"
-        except ProcessLookupError: action = "PROCESS_ALREADY_DEAD"
-        except Exception as e: action = f"KILL_FAILED_{str(e)}"
-            
-        if action in ["TERMINATED", "PROCESS_ALREADY_DEAD"]:
-            try:
-                os.remove(binary_path)
-                action = "TERMINATED_AND_DELETED"
-            except Exception:
-                action = "TERMINATED_BUT_DELETE_FAILED"
+            if self.bpf is not None:
+                self.bpf["blocked_pids"][ctypes.c_uint32(pid)] = ctypes.c_uint32(1)
+        except Exception:
+            pass
+        
+        try:
+            os.remove(binary_path)
+            delete_status = "DELETED_FROM_DISK"
+        except FileNotFoundError:
+            delete_status = "ALREADY_ABSENT"
+        except PermissionError:
+            delete_status = "DELETE_DENIED"
+        except Exception as e:
+            delete_status = f"DELETE_FAILED_({type(e).__name__})"
+
+        neutralized = killed_count > 0 and delete_status in ("DELETED_FROM_DISK", "ALREADY_ABSENT")
 
         alert = {
             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "engine_tier": engine_tier, "status": "CRITICAL", "pid": pid,
             "process_name": process_name, "binary_path": binary_path, "syscall": syscall_used,
-            "signature_match": signature_match, "mitre_attack": mitre_tag, "action_taken": action
+            "signature_match": signature_match, "mitre_attack": mitre_tag,
+            "kill_status": kill_status, "delete_status": delete_status,
+            "processes_killed": killed_count,
+            "action_taken": f"{kill_status}+{delete_status}",
         }
-        print(f"\n[!!!] MALICIOUS EXECUTION NEUTRALIZED [!!!]\n{json.dumps(alert, indent=4)}")
+        record_alert(alert)
+
+        banner = "MALICIOUS EXECUTION NEUTRALIZED" if neutralized else "MALICIOUS EXECUTION - PARTIAL CONTAINMENT"
+        print(f"\n[!!!] {banner} [!!!]\n{json.dumps(alert, indent=4)}")
+
+    def _resolve_exec_path(self, pid: int, raw_filename: str) -> str | None:
+        """
+        Resolves the target of an exec to an absolute path.
+
+        NOTE: at sys_enter the exec has not yet occurred, so /proc/PID/exe still
+        points at the *calling* binary (usually the shell) and must never be used
+        here. Relative paths are resolved against the caller's cwd instead.
+        """
+        if os.path.isabs(raw_filename):
+            return raw_filename
+
+        if "/" in raw_filename:                     # ./payload, ../bin/x, sub/dir/x
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+                return os.path.realpath(os.path.join(cwd, raw_filename))
+            except OSError:
+                return None
+
+        return shutil.which(raw_filename)           # bare command -> PATH lookup
 
     def _handle_event(self, cpu, data, size):
         event = ctypes.cast(data, ctypes.POINTER(ExecEvent)).contents
@@ -319,21 +419,81 @@ class HidsEbpfExecutionMonitor(threading.Thread):
         syscall_used = event.syscall_type.decode("utf-8", errors="ignore").strip()
         comm = event.comm.decode("utf-8", errors="ignore").strip()
 
-        if not raw_filename or event.pid == self.engine_pid: return
 
-        resolved_path = raw_filename
-        if not os.path.isabs(resolved_path):
-            try: resolved_path = os.readlink(f"/proc/{event.pid}/exe")
-            except OSError:
-                if (found := shutil.which(resolved_path)): resolved_path = found
-
-        if event.kernel_killed == 1:
-            if Path(resolved_path).is_file():
-                try: os.remove(resolved_path)
-                except Exception: pass
+        if event.pid == self.engine_pid:
             return
 
-        if Path(resolved_path).is_file(): self._scan_execution(resolved_path, comm, event.pid, syscall_used)
+        if not raw_filename:
+            if event.fd >= 0:
+                self._handle_fileless_execution(event.pid, event.fd, comm, syscall_used)
+            return
+
+        resolved_path = self._resolve_exec_path(event.pid, raw_filename)
+        if not resolved_path:
+            return
+
+        # --- Already blocked in-kernel: remove the artefact and stop ---
+        if event.kernel_killed == 1:
+            try:
+                os.remove(resolved_path)
+            except Exception:
+                pass
+            return
+
+        if Path(resolved_path).is_file():
+            self._scan_execution(resolved_path, comm, event.pid, syscall_used)
+
+    def _handle_fileless_execution(self, pid: int, fd: int, comm: str, syscall_used: str):
+        """
+        Handles anonymous in-memory execution. The payload never touches the
+        filesystem, so Tier 1/2 cannot scan it; detection is based on the
+        execution pattern itself rather than on content.
+        """
+        try:
+            fd_target = os.readlink(f"/proc/{pid}/fd/{fd}")
+        except OSError:
+            fd_target = "<unresolvable>"
+
+        anonymous = (
+            fd_target.startswith("/memfd:")
+            or fd_target.startswith("/dev/shm")
+            or fd_target == "<unresolvable>"
+            or "(deleted)" in fd_target
+        )
+        if not anonymous:
+            return
+
+        mitre_tag = {
+            "tactic": "Defense Evasion",
+            "technique_id": "T1620",
+            "technique_name": "Reflective Code Loading",
+            "description": ("Execution of an anonymous in-memory file descriptor via execveat with "
+                            "AT_EMPTY_PATH. The payload has no on-disk representation, defeating "
+                            "hash- and content-based scanning."),
+        }
+
+        if self.kill_on_fileless:
+            killed_count = kill_entire_process_tree(pid)
+            kill_status = (f"TERMINATED_TREE_({killed_count}_PROCESSES)"
+                           if killed_count > 0 else "PROCESS_ALREADY_DEAD_OR_DENIED")
+            action = "TERMINATED_FILELESS_PAYLOAD"
+            status = "CRITICAL"
+        else:
+            kill_status = "NOT_ATTEMPTED_LOG_ONLY_MODE"
+            action = "LOGGED_FOR_SOC_REVIEW"
+            status = "WARNING"
+
+        alert = {
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "engine_tier": "FILELESS_EXECUTION", "status": status, "pid": pid,
+            "process_name": comm, "binary_path": fd_target, "syscall": syscall_used,
+            "signature_match": "ANONYMOUS_MEMORY_EXECUTION", "mitre_attack": mitre_tag,
+            "kill_status": kill_status,
+            "delete_status": "NOT_APPLICABLE_NO_DISK_ARTEFACT",
+            "action_taken": action,
+        }
+        record_alert(alert)
+        print(f"\n[!!!] FILELESS EXECUTION DETECTED [!!!]\n{json.dumps(alert, indent=4)}")
 
     def _scan_execution(self, binary_path, comm, pid, syscall_used):
         try:
@@ -400,8 +560,10 @@ class HidsAnomalyMonitor(threading.Thread):
         with open(SCALER_PATH, "rb") as f: self.scaler = pickle.load(f)
 
         try:
-            self.bpf = BPF(text=EBPF_ANOMALY_PROBE)
-            self.bpf["ignored_pids"][ctypes.c_uint32(self.engine_pid)] = ctypes.c_uint8(1)
+            with bcc_compile_lock:
+                self.bpf = BPF(text=EBPF_ANOMALY_PROBE)
+                self.bpf["ignored_pids"][ctypes.c_uint32(self.engine_pid)] = ctypes.c_uint8(1)
+            
             syscall_counts = self.bpf["syscall_counts"]
             print("[+] [Tier 3] eBPF Behavioral Anomaly Engine active.")
         except Exception as e:
@@ -455,20 +617,152 @@ class HidsAnomalyMonitor(threading.Thread):
                             "reconstruction_loss": round(loss, 5),
                             "action_taken": "LOGGED_FOR_SOC_REVIEW",
                             "remediation_hint": f"kill -9 {pid}",
-                            "mitre_attack": mitre_tag  # Now dynamically injected!
+                            "mitre_attack": mitre_tag
                         }
                         
-                        # Log to file for SOC Dashboard (We'll add this feature next)
-                        try:
-                            with open("/tmp/hids_alerts.jsonl", "a") as f:
-                                f.write(json.dumps(alert) + "\n")
-                        except Exception:
-                            pass
+                        # Log to file for SOC Dashboard
+                        record_alert(alert)
                             
                         print(f"\n\033[93m[!] BEHAVIORAL ANOMALY DETECTED [!]\033[0m\n{json.dumps(alert, indent=4)}")
                 except Exception: pass
 
     def stop(self): self.running = False
+
+EBPF_ANTI_TAMPER_PROBE = r"""
+#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+
+BPF_HASH(protected_pids, u32, u8);
+
+struct tamper_event_t {
+    u32 attacker_pid;
+    u32 attacker_uid;
+    u32 target_pid;
+    int signal;
+    u32 retaliated;
+    char attacker_comm[TASK_COMM_LEN];
+};
+
+BPF_PERF_OUTPUT(tamper_events);
+
+TRACEPOINT_PROBE(syscalls, sys_enter_kill) {
+    u32 target_pid = args->pid;
+    int sig = args->sig;
+
+    u8 *is_protected = protected_pids.lookup(&target_pid);
+    if (!is_protected) return 0;
+
+    u32 attacker_pid = bpf_get_current_pid_tgid() >> 32;
+    if (attacker_pid == target_pid) return 0;   // ignore self-signalling
+
+    struct tamper_event_t event = {};
+    event.attacker_pid = attacker_pid;
+    event.attacker_uid = bpf_get_current_uid_gid();
+    event.target_pid = target_pid;
+    event.signal = sig;
+    bpf_get_current_comm(&event.attacker_comm, sizeof(event.attacker_comm));
+
+    // Retaliate only against terminating signals. Non-terminating signals are
+    // recorded but not acted upon.
+    if (sig == 9 || sig == 15) {
+        bpf_send_signal_thread(9);
+        event.retaliated = 1;
+    } else {
+        event.retaliated = 0;
+    }
+
+    tamper_events.perf_submit(args, &event, sizeof(event));
+    return 0;
+}
+"""
+
+
+class TamperEvent(ctypes.Structure):
+    _fields_ = [
+        ("attacker_pid", ctypes.c_uint32),
+        ("attacker_uid", ctypes.c_uint32),
+        ("target_pid", ctypes.c_uint32),
+        ("signal", ctypes.c_int),
+        ("retaliated", ctypes.c_uint32),
+        ("attacker_comm", ctypes.c_char * 16),
+    ]
+
+class HidsAntiTamper(threading.Thread):
+
+    def __init__(self, engine_pid):
+        super().__init__(daemon=True)
+        self.engine_pid = engine_pid
+        self.bpf = None
+        self.running = True
+
+    def _handle_tamper_event(self, cpu, data, size):
+        event = ctypes.cast(data, ctypes.POINTER(TamperEvent)).contents
+        comm = event.attacker_comm.decode("utf-8", errors="ignore").strip()
+
+        try:
+            user = pwd.getpwuid(event.attacker_uid).pw_name
+        except (KeyError, Exception):
+            user = str(event.attacker_uid)
+
+        try:
+            exe = os.readlink(f"/proc/{event.attacker_pid}/exe")
+        except OSError:
+            exe = "<exited>"
+
+        try:
+            with open(f"/proc/{event.attacker_pid}/cmdline", "rb") as f:
+                cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+        except OSError:
+            cmdline = "<unavailable>"
+
+        alert = {
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "engine_tier": "ANTI_TAMPER",
+            "status": "CRITICAL" if event.retaliated else "WARNING",
+            "pid": event.attacker_pid,
+            "process_name": comm,
+            "binary_path": exe,
+            "cmdline": cmdline,
+            "user": user,
+            "uid": event.attacker_uid,
+            "syscall": "kill",
+            "target_pid": event.target_pid,
+            "signal_sent": event.signal,
+            "signature_match": "AGENT_TERMINATION_ATTEMPT",
+            "mitre_attack": {
+                "tactic": "Defense Evasion",
+                "technique_id": "T1562.001",
+                "technique_name": "Impair Defenses: Disable or Modify Tools",
+                "description": ("A process attempted to send a terminating signal to the monitoring "
+                                "agent. The attempt was attributed and recorded prior to any "
+                                "resulting agent shutdown."),
+            },
+            "action_taken": ("ATTACKER_TERMINATED_MUTUAL_KILL" if event.retaliated
+                             else "RECORDED_NON_TERMINATING_SIGNAL"),
+        }
+        record_alert(alert)
+        print(f"\n\033[91m[!!!] TAMPER ATTEMPT DETECTED [!!!]\033[0m\n{json.dumps(alert, indent=4)}")
+
+    def run(self):
+        try:
+            with bcc_compile_lock:
+                self.bpf = BPF(text=EBPF_ANTI_TAMPER_PROBE)
+                # Register our own PID as protected
+                self.bpf["protected_pids"][ctypes.c_uint32(self.engine_pid)] = ctypes.c_uint8(1)
+            self.bpf["tamper_events"].open_perf_buffer(self._handle_tamper_event)
+            print("[+] [Tier 0] eBPF Anti-Tamper (attribution + mutual termination) active.")
+        except Exception as e:
+            print(f"[-] Failed to load anti-tamper probe: {e}")
+            return
+
+        while self.running:
+            try:
+                self.bpf.perf_buffer_poll(timeout=100)
+            except Exception:
+                break
+
+    def stop(self):
+        self.running = False
 
 class HidsHandler(FileSystemEventHandler):
     def __init__(self, sha256_engine: HidsSha256Engine, yara_engine: HidsYaraEngine):
@@ -498,11 +792,14 @@ class HidsHandler(FileSystemEventHandler):
         except OSError:
             return
 
-        # Reduced debounce window to 0.1s
         current_time = time.time()
-        if file_path in self.recent_events and (current_time - self.recent_events[file_path]) < 0.1:
+        if file_path in self.recent_events and (current_time - self.recent_events[file_path]) < 0.5:
             return
         self.recent_events[file_path] = current_time
+
+        if len(self.recent_events) > 5000:
+            cutoff = current_time - 60
+            self.recent_events = {k: v for k, v in self.recent_events.items() if v > cutoff}
 
         try:
             # Tier 1: SHA256 Signature Scan
@@ -531,6 +828,7 @@ class HidsHandler(FileSystemEventHandler):
                     "mitre_attack": mitre_tag,
                     "action_taken": action,
                 }
+                record_alert(alert)
                 print(f"\n[!!!] MALICIOUS FILE DROP DETECTED (TIER 1) [!!!]\n{json.dumps(alert, indent=4)}")
                 return
 
@@ -559,6 +857,7 @@ class HidsHandler(FileSystemEventHandler):
                     "mitre_attack": mitre_tag,
                     "action_taken": action,
                 }
+                record_alert(alert)
                 print(f"\n[!!!] MALICIOUS PATTERN DROP DETECTED (TIER 2) [!!!]\n{json.dumps(alert, indent=4)}")
                 return
 
@@ -612,6 +911,9 @@ def start_hids():
     exec_monitor = HidsEbpfExecutionMonitor(sha256_engine, yara_engine, engine_pid)
     exec_monitor.start()
 
+    anti_tamper = HidsAntiTamper(engine_pid)
+    anti_tamper.start()
+
     anomaly_monitor = HidsAnomalyMonitor(engine_pid)
     anomaly_monitor.start()
 
@@ -622,6 +924,7 @@ def start_hids():
         print("\n[*] Stopping Agent...")
         exec_monitor.stop()
         anomaly_monitor.stop()
+        anti_tamper.stop() 
         for o in observers: o.stop()
         for o in observers: o.join()
 
