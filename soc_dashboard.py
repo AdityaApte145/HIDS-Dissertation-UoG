@@ -5,9 +5,37 @@ import os
 import signal
 import sys
 import time
+import psutil
 from datetime import datetime
 
 ALERT_LOG_PATH = "/tmp/hids_alerts.jsonl"
+
+def kill_entire_process_tree(pid: int) -> int:
+    """
+    Recursively terminates a process and all its child worker processes.
+    Returns the total number of killed processes.
+    """
+    if pid <= 1:
+        return 0
+        
+    try:
+        parent = psutil.Process(pid)
+        children = parent.children(recursive=True)
+        
+        for child in children:
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                pass
+                
+        parent.kill()
+        return len(children) + 1
+    except (psutil.NoSuchProcess, PermissionError, Exception):
+        try:
+            os.kill(pid, signal.SIGKILL)
+            return 1
+        except Exception:
+            return 0
 
 class SocDashboard:
     def __init__(self, stdscr):
@@ -51,20 +79,19 @@ class SocDashboard:
             self.status_message = f"Error reading alerts: {e}"
 
     def kill_process(self, pid: int):
-        """Sends SIGKILL to the selected PID."""
+        """Recursively terminates the selected process tree via dashboard keypress."""
         if pid <= 1:
             self.status_message = f"Refused to kill system PID {pid}!"
             return
 
         try:
-            os.kill(pid, signal.SIGKILL)
-            self.status_message = f"Successfully terminated PID {pid} via SIGKILL."
-        except ProcessLookupError:
-            self.status_message = f"PID {pid} is already dead or does not exist."
-        except PermissionError:
-            self.status_message = f"Permission denied to kill PID {pid} (run dashboard with sudo)."
+            killed_count = kill_entire_process_tree(pid)
+            if killed_count > 0:
+                self.status_message = f"Successfully terminated process tree for PID {pid} ({killed_count} processes killed)."
+            else:
+                self.status_message = f"PID {pid} is already dead or could not be killed."
         except Exception as e:
-            self.status_message = f"Failed to kill PID {pid}: {e}"
+            self.status_message = f"Failed to kill process tree for PID {pid}: {e}"
 
     def inspect_alert(self, alert: dict):
         """Displays full JSON and MITRE details in a pop-up overlay."""
